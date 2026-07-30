@@ -299,19 +299,123 @@ func (c *Config) WriteTemplatesConfig() error {
 	if err != nil {
 		return errkit.Newf("failed to marshal nuclei config: %v", err)
 	}
-	if err = os.WriteFile(c.getTemplatesConfigFilePath(), bin, 0600); err != nil {
+	configFilePath := c.getTemplatesConfigFilePath()
+	if err = writeTemplatesConfigFile(configFilePath, bin, replaceTemplatesConfigFile); err != nil {
 		return errkit.Newf("failed to write nuclei config file at %s: %v", c.getTemplatesConfigFilePath(), err)
 	}
 	return nil
 }
 
+func writeTemplatesConfigFile(configFilePath string, contents []byte, replace func(string, string) error) error {
+	writePath := configFilePath
+	if info, err := os.Lstat(configFilePath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		writePath, err = resolveConfigWritePath(configFilePath)
+		if err != nil {
+			return fmt.Errorf("resolve config file symlink: %w", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("inspect config file path: %w", err)
+	}
+
+	mode := os.FileMode(0o600)
+	preserveMode := false
+
+	if info, err := os.Stat(writePath); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("config file target %q is not a regular file", writePath)
+		}
+
+		mode = info.Mode().Perm()
+		preserveMode = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect existing config file: %w", err)
+	}
+
+	temporary, err := os.CreateTemp(filepath.Dir(writePath), filepath.Base(writePath)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temporary config file: %w", err)
+	}
+
+	defer func() {
+		_ = temporary.Close()
+		_ = os.Remove(temporary.Name())
+	}()
+
+	if _, err := temporary.Write(contents); err != nil {
+		return fmt.Errorf("write temporary config file: %w", err)
+	}
+
+	if preserveMode {
+		if err := temporary.Chmod(mode); err != nil {
+			return fmt.Errorf("preserve config file permissions: %w", err)
+		}
+	}
+
+	if err := temporary.Sync(); err != nil {
+		return fmt.Errorf("sync temporary config file: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("close temporary config file: %w", err)
+	}
+	if err := replace(temporary.Name(), writePath); err != nil {
+		return fmt.Errorf("replace config file: %w", err)
+	}
+
+	return nil
+}
+
+func resolveConfigWritePath(configFilePath string) (string, error) {
+	current := configFilePath
+
+	for range 255 {
+		info, err := os.Lstat(current)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				return "", err
+			}
+
+			parent, err := filepath.EvalSymlinks(filepath.Dir(current))
+			if err != nil {
+				return "", err
+			}
+
+			return filepath.Join(parent, filepath.Base(current)), nil
+		}
+
+		if info.Mode()&os.ModeSymlink == 0 {
+			return filepath.EvalSymlinks(current)
+		}
+
+		target, err := os.Readlink(current)
+		if err != nil {
+			return "", err
+		}
+
+		if !filepath.IsAbs(target) {
+			parent, err := filepath.EvalSymlinks(filepath.Dir(current))
+			if err != nil {
+				return "", err
+			}
+
+			target = filepath.Join(parent, target)
+		}
+
+		current = filepath.Clean(target)
+	}
+
+	return "", fmt.Errorf("too many config file symlinks")
+}
+
 // WriteTemplatesIndex writes the nuclei templates index file
 func (c *Config) WriteTemplatesIndex(index map[string]string) error {
 	indexFile := c.GetTemplateIndexFilePath()
+
 	var buff bytes.Buffer
+
 	for k, v := range index {
 		_, _ = buff.WriteString(k + "," + v + "\n")
 	}
+
 	return os.WriteFile(indexFile, buff.Bytes(), 0600)
 }
 
@@ -327,6 +431,7 @@ func (c *Config) createConfigDirIfNotExists() error {
 			return errkit.Newf("could not create nuclei config directory at %s: %v", c.configDir, err)
 		}
 	}
+
 	return nil
 }
 
@@ -337,6 +442,7 @@ func (c *Config) copyIgnoreFile() {
 		c.Logger.Error().Msgf("Could not create nuclei config directory at %s: %s", c.configDir, err)
 		return
 	}
+
 	ignoreFilePath := c.GetIgnoreFilePath()
 	if !fileutil.FileExists(ignoreFilePath) {
 		// copy ignore file from default config directory
